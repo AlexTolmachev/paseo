@@ -444,7 +444,7 @@ interface ACPAgentClientOptions {
   now?: () => number;
 }
 
-interface ACPAgentSessionOptions {
+export interface ACPAgentSessionOptions {
   provider: string;
   logger: Logger;
   runtimeSettings?: ProviderRuntimeSettings;
@@ -934,12 +934,19 @@ export class ACPAgentClient implements AgentClient {
     this.now = options.now ?? Date.now;
   }
 
+  protected createAgentSession(
+    config: AgentSessionConfig,
+    options: ACPAgentSessionOptions,
+  ): ACPAgentSession {
+    return new ACPAgentSession(config, options);
+  }
+
   async createSession(
     config: AgentSessionConfig,
     launchContext?: AgentLaunchContext,
   ): Promise<AgentSession> {
     this.assertProvider(config);
-    const session = new ACPAgentSession(
+    const session = this.createAgentSession(
       { ...config, provider: this.provider },
       {
         provider: this.provider,
@@ -991,7 +998,7 @@ export class ACPAgentClient implements AgentClient {
       provider: this.provider,
       cwd,
     };
-    const session = new ACPAgentSession(mergedConfig, {
+    const session = this.createAgentSession(mergedConfig, {
       provider: this.provider,
       logger: this.logger,
       runtimeSettings: this.runtimeSettings,
@@ -1668,8 +1675,8 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private sessionId: string | null = null;
   private currentMode: string | null = null;
   private availableModes: AgentMode[];
-  private currentModel: string | null = null;
-  private availableModels: AvailableACPModel[] | null = null;
+  protected currentModel: string | null = null;
+  protected availableModels: AvailableACPModel[] | null = null;
   private thinkingOptionId: string | null = null;
   private currentTitle: string | null = null;
   private lastActivityAt: string | null = null;
@@ -1680,7 +1687,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private waitForInitialCommands: boolean;
   private initialCommandsWaitTimeoutMs: number;
   private readonly extensionCommandsParser?: ACPExtensionCommandsParser;
-  private currentTurnUsage: AgentUsage | undefined;
+  protected currentTurnUsage: AgentUsage | undefined;
   private activeForegroundTurnId: string | null = null;
   private fallbackAssistantMessageId: string | null = null;
   private closed = false;
@@ -1904,6 +1911,60 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     for (const item of history) {
       yield { type: "timeline", provider: this.provider, item };
     }
+  }
+
+  protected persistedUserMessages(): Extract<AgentTimelineItem, { type: "user_message" }>[] {
+    const messages: Extract<AgentTimelineItem, { type: "user_message" }>[] = [];
+    for (const item of this.persistedHistory) {
+      if (item.type === "user_message") {
+        messages.push(item);
+      }
+    }
+    return messages;
+  }
+
+  protected async callAcpExtensionMethod(
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    if (!this.connection) {
+      throw new Error(`${this.provider} session is not initialized`);
+    }
+    return this.runACPRequest(() => this.connection!.extMethod(method, params));
+  }
+
+  // Replay session/load into persistedHistory so AgentManager can rehydrate
+  // after a provider rewind. Live sessions have already drained streamHistory.
+  protected async reloadSessionHistory(): Promise<void> {
+    const connection = this.connection;
+    const sessionId = this.sessionId;
+    if (!connection || !sessionId) {
+      throw new Error(`${this.provider} session is not initialized`);
+    }
+    if (!this.agentCapabilities?.loadSession) {
+      throw new Error(`${this.provider} does not support ACP session load`);
+    }
+
+    this.persistedHistory.length = 0;
+    this.pendingUserMessage = null;
+    this.historyPending = false;
+    this.toolCalls.clear();
+    this.fallbackAssistantMessageId = null;
+    this.replayingHistory = true;
+    try {
+      const response = await this.runACPRequest(() =>
+        connection.loadSession({
+          sessionId,
+          cwd: this.config.cwd,
+          mcpServers: this.acpMcpServers(),
+        }),
+      );
+      this.deliverTranslatedEvents(this.flushPendingUserMessage());
+      this.applySessionState(response);
+    } finally {
+      this.replayingHistory = false;
+    }
+    this.historyPending = this.persistedHistory.length > 0;
   }
 
   async getRuntimeInfo(): Promise<AgentRuntimeInfo> {
@@ -3072,7 +3133,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     void update;
   }
 
-  private handlePromptResponse(response: PromptResponse, turnId: string): void {
+  protected handlePromptResponse(response: PromptResponse, turnId: string): void {
     this.currentTurnUsage = mapACPUsage(response.usage) ?? this.currentTurnUsage;
 
     switch (response.stopReason) {
@@ -3100,7 +3161,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     }
   }
 
-  private wrapTimeline(item: AgentTimelineItem): AgentStreamEvent {
+  protected wrapTimeline(item: AgentTimelineItem): AgentStreamEvent {
     return {
       type: "timeline",
       provider: this.provider,
@@ -3109,7 +3170,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     };
   }
 
-  private pushEvent(event: AgentStreamEvent): void {
+  protected pushEvent(event: AgentStreamEvent): void {
     this.logger.trace(
       {
         agentId: this.agentId,
